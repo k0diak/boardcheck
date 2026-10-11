@@ -1,0 +1,138 @@
+# boardcheck — post-code lifecycle on GitLab.
+# verify → secure → package → deploy staging (+ smoke) → release (tags) → deploy production (approval)
+# Scheduled pipelines run only the monitor stage, which re-checks production and opens incidents.
+
+stages: [verify, secure, package, staging, release, production, monitor]
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  STAGING_URL: https://boardcheck-staging.xrpbreadcrumbs.workers.dev
+  PRODUCTION_URL: https://boardcheck.xrpbreadcrumbs.workers.dev
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+.not-scheduled: &not-scheduled
+  - if: $CI_PIPELINE_SOURCE == "schedule"
+    when: never
+
+# ── verify ───────────────────────────────────────────────────────────────────────────────
+test:
+  stage: verify
+  image: python:${PY}-slim
+  parallel:
+    matrix:
+      - PY: ["3.9", "3.10", "3.11", "3.12"]
+  rules:
+    - *not-scheduled
+    - when: on_success
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq nodejs > /dev/null
+  script:
+    - node --check docs/boardcheck.js
+    - node --check service/worker.js
+    - python -m unittest discover -s tests -v   # includes the JS↔Python parity test
+
+# ── secure ───────────────────────────────────────────────────────────────────────────────
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.v2.gitlab-ci.yml   # Ultimate only; skipped on lower tiers
+
+sast:
+  stage: secure
+secret_detection:
+  stage: secure
+dependency_scanning:
+  stage: secure
+
+# ── package ──────────────────────────────────────────────────────────────────────────────
+wheel:
+  stage: package
+  image: python:3.12-slim
+  rules:
+    - *not-scheduled
+    - when: on_success
+  script:
+    - pip install -q build twine
+    - python -m build
+    - twine check dist/*
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        TWINE_PASSWORD=${CI_JOB_TOKEN} TWINE_USERNAME=gitlab-ci-token \
+          python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
+      fi
+  artifacts:
+    paths: [dist/]
+    expire_in: 30 days
+
+image:
+  stage: package
+  image: docker:27
+  services: [docker:27-dind]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - if [ -n "$CI_COMMIT_TAG" ]; then docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"; docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"; fi
+
+# ── deploy (Cloudflare Workers; config as code in service/wrangler.toml) ───────────────────
+.deploy: &deploy
+  image: node:22-slim
+  before_script:
+    - cd service && npm ci --silent
+  script:
+    - npx wrangler deploy ${WRANGLER_ENV} --var BOARDCHECK_VERSION:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+    - cd .. && node scripts/smoke.mjs "$DEPLOY_URL"
+
+deploy_staging:
+  <<: *deploy
+  stage: staging
+  variables: { WRANGLER_ENV: "", DEPLOY_URL: $STAGING_URL }
+  environment: { name: staging, url: $STAGING_URL }
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script: ["echo releasing $CI_COMMIT_TAG"]
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: boardcheck $CI_COMMIT_TAG
+    description: ./RELEASE_NOTES.md
+
+deploy_production:
+  <<: *deploy
+  stage: production
+  variables: { WRANGLER_ENV: "--env production", DEPLOY_URL: $PRODUCTION_URL }
+  environment: { name: production, url: $PRODUCTION_URL }
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual          # the one human gate: approve the production deploy
+      allow_failure: false
+
+# ── monitor (scheduled pipeline) ───────────────────────────────────────────────────────────
+monitor:
+  stage: monitor
+  image: node:22-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - node scripts/monitor.mjs

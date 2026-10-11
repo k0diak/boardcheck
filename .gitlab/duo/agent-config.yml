@@ -1,0 +1,7 @@
+# Runtime setup for Duo flows running on CI runners (read from the default branch).
+setup_script:
+  - pip install -q -e .
+network_policy:
+  allowed_domains:
+    - boardcheck-staging.xrpbreadcrumbs.workers.dev
+    - boardcheck.xrpbreadcrumbs.workers.dev

@@ -1,0 +1,17 @@
+name = "boardcheck-staging"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+account_id = "739bdce874726cb34836e2c9df62c464"
+workers_dev = true
+
+[assets]
+directory = "../docs"
+binding = "ASSETS"
+
+[vars]
+ENVIRONMENT = "staging"
+
+[env.production]
+name = "boardcheck"
+[env.production.vars]
+ENVIRONMENT = "production"

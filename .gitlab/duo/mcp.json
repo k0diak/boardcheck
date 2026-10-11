@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "boardcheck": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "agent_market_signals.mcp_server"],
+      "approvedTools": true
+    }
+  }
+}
