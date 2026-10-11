@@ -66,7 +66,7 @@ wheel:
     paths: [dist/]
     expire_in: 30 days
 
-image:
+container_image:
   stage: package
   image: docker:27
   services: [docker:27-dind]
