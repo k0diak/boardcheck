@@ -1,8 +1,8 @@
 # boardcheck — post-code lifecycle on GitLab.
-# verify → secure → package → deploy staging (+ smoke) → release (tags) → deploy production (approval)
+# verify → test (security scanners) → package → deploy staging (+ smoke) → release (tags) → deploy production (approval)
 # Scheduled pipelines run only the monitor stage, which re-checks production and opens incidents.
 
-stages: [verify, secure, package, staging, release, production, monitor]
+stages: [verify, test, package, staging, release, production, monitor]   # GitLab's scanner templates run in `test`
 
 variables:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -39,18 +39,12 @@ test:
     - node --check service/worker.js
     - python -m unittest discover -s tests -v   # includes the JS↔Python parity test
 
-# ── secure ───────────────────────────────────────────────────────────────────────────────
+# ── secure (scanner templates; their jobs run in the `test` stage) ───────────────────────────────────────────────────────────────────────────────
 include:
   - template: Jobs/SAST.gitlab-ci.yml
   - template: Jobs/Secret-Detection.gitlab-ci.yml
   - template: Jobs/Dependency-Scanning.v2.gitlab-ci.yml   # Ultimate only; skipped on lower tiers
 
-sast:
-  stage: secure
-secret_detection:
-  stage: secure
-dependency_scanning:
-  stage: secure
 
 # ── package ──────────────────────────────────────────────────────────────────────────────
 wheel:
@@ -103,6 +97,8 @@ deploy_staging:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
+    - if: $CLOUDFLARE_API_TOKEN == null     # deploy credentials not configured: skip, don't fail
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 release:
@@ -123,6 +119,8 @@ deploy_production:
   environment: { name: production, url: $PRODUCTION_URL }
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CLOUDFLARE_API_TOKEN == null     # deploy credentials not configured: skip, don't fail
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual          # the one human gate: approve the production deploy
